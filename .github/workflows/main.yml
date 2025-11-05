@@ -61,7 +61,7 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
           
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
           
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
@@ -73,66 +73,108 @@ jobs:
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          try {
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Remove-Item $installerPath -Force
+              Write-Host "Tailscale installed successfully"
+          } catch {
+              Write-Host "Failed to install Tailscale: $($_.Exception.Message)"
+              exit 1
+          }
+
+      - name: Check Tailscale Auth Key
+        run: |
+          Write-Host "Checking Tailscale authentication..."
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+              Write-Host "ERROR: TAILSCALE_AUTH_KEY secret is not set"
+              Write-Host "Please add a valid Tailscale auth key to your GitHub secrets"
+              exit 1
+          }
+          
+          # اختبار بسيط للمفتاح
+          $keyTest = $env:TAILSCALE_AUTH_KEY.Substring(0, [Math]::Min(5, $env:TAILSCALE_AUTH_KEY.Length))
+          Write-Host "Auth key starts with: $keyTest..."
 
       - name: Establish Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-20rdp-$env:GITHUB_RUN_ID
+          Write-Host "Attempting to connect to Tailscale..."
           
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 15) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
+          # محاولة الاتصال مع معالجة الأخطاء
+          $maxRetries = 3
+          $retryCount = 0
+          $connected = $false
           
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify All RDP Ports
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "Testing all 20 RDP ports..."
-          
-          $activePorts = @()
-          for ($port = 3389; $port -le 3408; $port++) {
-              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $port -WarningAction SilentlyContinue
-              if ($testResult.TcpTestSucceeded) {
-                  $activePorts += $port
-                  Write-Host "PORT $port: ACTIVE"
-              } else {
-                  Write-Host "PORT $port: FAILED"
+          while (-not $connected -and $retryCount -lt $maxRetries) {
+              $retryCount++
+              Write-Host "Attempt $retryCount of $maxRetries"
+              
+              try {
+                  $result = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-20rdp-$env:GITHUB_RUN_ID 2>&1
+                  Write-Host "Tailscale output: $result"
+                  
+                  # انتظار وفحص العنوان IP
+                  Start-Sleep -Seconds 10
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  
+                  if ($tsIP) {
+                      $connected = $true
+                      echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                      Write-Host "Success! Tailscale IP: $tsIP"
+                      break
+                  } else {
+                      Write-Host "No IP assigned yet. Retrying..."
+                      Start-Sleep -Seconds 10
+                  }
+                  
+              } catch {
+                  Write-Host "Error during Tailscale connection: $($_.Exception.Message)"
               }
           }
           
-          Write-Host "Active RDP Ports: $($activePorts -join ', ')"
-          echo "ACTIVE_PORTS=$($activePorts -join ',')" >> $env:GITHUB_ENV
+          if (-not $connected) {
+              Write-Host "WARNING: Failed to connect to Tailscale after $maxRetries attempts"
+              Write-Host "Continuing with local RDP setup only..."
+              echo "TAILSCALE_IP=LOCAL_ONLY" >> $env:GITHUB_ENV
+          }
 
-      - name: Permanent Multi-RDP Session
+      - name: Get Public IP as Fallback
+        if: env.TAILSCALE_IP == 'LOCAL_ONLY'
         run: |
-          Write-Host "=== 20 RDP SESSIONS ==="
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          try {
+              $publicIP = (Invoke-WebRequest -Uri "https://api.ipify.org" -TimeoutSec 10).Content
+              echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+              Write-Host "Public IP: $publicIP"
+          } catch {
+              Write-Host "Could not retrieve public IP"
+              echo "PUBLIC_IP=UNKNOWN" >> $env:GITHUB_ENV
+          }
+
+      - name: Display Connection Information
+        run: |
+          Write-Host "=== 20 RDP SESSIONS SETUP COMPLETE ==="
           Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_CREDS"
-          Write-Host "Active Ports: $env:ACTIVE_PORTS"
-          Write-Host "Total Ports: 20 (3389-3408)"
-          Write-Host "Started: $(Get-Date)"
-          Write-Host "Status: PERMANENT - 20 Simultaneous RDP Sessions"
-          Write-Host "To stop: Click 'Cancel workflow' in GitHub Actions"
-          Write-Host "====================================="
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "RDP Ports: 3389 to 3408"
           
-          # مثال للاتصال
-          Write-Host "Connection Examples:"
-          Write-Host "   mstsc /v:$env:TAILSCALE_IP:3389"
-          Write-Host "   mstsc /v:$env:TAILSCALE_IP:3390"
-          Write-Host "   ... up to :3408"
+          if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -ne 'LOCAL_ONLY') {
+              Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+              Write-Host "Connection method: Tailscale VPN"
+          } elseif ($env:PUBLIC_IP -and $env:PUBLIC_IP -ne 'UNKNOWN') {
+              Write-Host "Public IP: $env:PUBLIC_IP"
+              Write-Host "Connection method: Public IP (if ports are open)"
+          } else {
+              Write-Host "Connection: Local machine only"
+          }
           
+          Write-Host "Example connections:"
+          Write-Host "  mstsc /v:$env:TAILSCALE_IP:3389"
+          Write-Host "  mstsc /v:$env:TAILSCALE_IP:3390"
+          Write-Host "  ... etc up to port 3408"
+          Write-Host "======================================"
+
+      - name: Permanent RDP Session
+        run: |
           $startTime = Get-Date
           $checkCount = 0
           
@@ -140,7 +182,7 @@ jobs:
               $checkCount++
               $uptime = (Get-Date) - $startTime
               
-              # فحص دوري كل 10 دقائق
+              # فحص دوري
               if ($checkCount % 120 -eq 0) {
                   Write-Host "[$(Get-Date)] Health Check - Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))"
                   
@@ -150,18 +192,11 @@ jobs:
                       Write-Host "Restarting RDP Service..."
                       Start-Service -Name TermService -Force
                   }
-                  
-                  # فحص عشوائي لبضعة منافذ
-                  $samplePorts = @(3389, 3395, 3400, 3408)
-                  foreach ($samplePort in $samplePorts) {
-                      $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $samplePort -WarningAction SilentlyContinue
-                      Write-Host "Port $samplePort: $(if ($test.TcpTestSucceeded) {'OK'} else {'FAILED'})"
-                  }
               }
               
               # تحديث الحالة كل دقيقة
               if ($checkCount % 12 -eq 0) {
-                  Write-Host "[$(Get-Date)] 20 RDP Sessions Active - Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))"
+                  Write-Host "[$(Get-Date)] RDP Sessions Active - Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))"
               }
               
               Start-Sleep -Seconds 5
