@@ -1,4 +1,4 @@
-name: 20 RDP Sessions
+name: Multiple RDP
 
 on:
   workflow_dispatch:
@@ -6,198 +6,132 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Configure Multiple RDP Ports
+      - name: Configure Core RDP Settings
         run: |
-          # تمكين RDP الأساسي
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          # Enable Remote Desktop and disable Network Level Authentication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
 
-          # إنشاء 20 منفذ لـ RDP (3389 إلى 3408)
-          for ($port = 3389; $port -le 3408; $port++) {
-              Write-Host "Creating RDP port $port"
-              
-              # نسخ إعدادات RDP الأساسية للمنفذ الجديد
-              $rdpParams = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-              New-Item -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp$port" -Force
-              
-              # نسخ جميع الإعدادات
-              $rdpParams.PSObject.Properties | ForEach-Object {
-                  if ($_.Name -notin @('PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider')) {
-                      Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp$port" -Name $_.Name -Value $_.Value -Force
-                  }
-              }
-              
-              # تعيين المنفذ المخصص
-              Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp$port" -Name "PortNumber" -Value $port -Force
+          # Allow incoming connections on port 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
 
-              # إضافة قاعدة جدار حماية للمنفذ
-              netsh advfirewall firewall add rule name="RDP-Port-$port" dir=in action=allow protocol=TCP localport=$port
-          }
-
-          # إعادة تشغيل الخدمة
           Restart-Service -Name TermService -Force
 
-      - name: Create Single RDP User
+      - name: Create Multiple RDP Users
         run: |
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          # Function to generate secure random password
+          function New-SecurePassword {
+              $charSet = @{
+                  Upper   = [char[]](65..90)      # A-Z
+                  Lower   = [char[]](97..122)     # a-z
+                  Number  = [char[]](48..57)      # 0-9
+                  Special = ([char[]](33..47) + [char[]](58..64) +
+                             [char[]](91..96) + [char[]](123..126))
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 3
+              $rawPassword += $charSet.Lower | Get-Random -Count 3
+              $rawPassword += $charSet.Number | Get-Random -Count 3
+              $rawPassword += $charSet.Special | Get-Random -Count 3
+              return -join ($rawPassword | Sort-Object { Get-Random })
           }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          
-          # إنشاء مستخدم واحد فقط
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-          
-          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-          
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
+
+          # Create 20 RDP users
+          $allUsers = @()
+          for ($i = 1; $i -le 20; $i++) {
+              $username = "RDPUser$i"
+              $password = New-SecurePassword
+              
+              # Create user
+              $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member $username
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+              
+              # Store user info
+              $userInfo = @{
+                  Username = $username
+                  Password = $password
+              }
+              $allUsers += $userInfo
+              
+              Write-Host "Created user: $username"
           }
+
+          # Convert to JSON and store in environment variable
+          $usersJson = $allUsers | ConvertTo-Json -Compress
+          echo "RDP_USERS_JSON=$usersJson" >> $env:GITHUB_ENV
+          echo "RDP_USERS_COUNT=$($allUsers.Count)" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
-          try {
-              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-              Remove-Item $installerPath -Force
-              Write-Host "Tailscale installed successfully"
-          } catch {
-              Write-Host "Failed to install Tailscale: $($_.Exception.Message)"
-              exit 1
-          }
-
-      - name: Check Tailscale Auth Key
-        run: |
-          Write-Host "Checking Tailscale authentication..."
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Host "ERROR: TAILSCALE_AUTH_KEY secret is not set"
-              Write-Host "Please add a valid Tailscale auth key to your GitHub secrets"
-              exit 1
-          }
-          
-          # اختبار بسيط للمفتاح
-          $keyTest = $env:TAILSCALE_AUTH_KEY.Substring(0, [Math]::Min(5, $env:TAILSCALE_AUTH_KEY.Length))
-          Write-Host "Auth key starts with: $keyTest..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
       - name: Establish Tailscale Connection
         run: |
-          Write-Host "Attempting to connect to Tailscale..."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
           
-          # محاولة الاتصال مع معالجة الأخطاء
-          $maxRetries = 3
-          $retryCount = 0
-          $connected = $false
-          
-          while (-not $connected -and $retryCount -lt $maxRetries) {
-              $retryCount++
-              Write-Host "Attempt $retryCount of $maxRetries"
-              
-              try {
-                  $result = & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-20rdp-$env:GITHUB_RUN_ID 2>&1
-                  Write-Host "Tailscale output: $result"
-                  
-                  # انتظار وفحص العنوان IP
-                  Start-Sleep -Seconds 10
-                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
-                  
-                  if ($tsIP) {
-                      $connected = $true
-                      echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-                      Write-Host "Success! Tailscale IP: $tsIP"
-                      break
-                  } else {
-                      Write-Host "No IP assigned yet. Retrying..."
-                      Start-Sleep -Seconds 10
-                  }
-                  
-              } catch {
-                  Write-Host "Error during Tailscale connection: $($_.Exception.Message)"
-              }
-          }
-          
-          if (-not $connected) {
-              Write-Host "WARNING: Failed to connect to Tailscale after $maxRetries attempts"
-              Write-Host "Continuing with local RDP setup only..."
-              echo "TAILSCALE_IP=LOCAL_ONLY" >> $env:GITHUB_ENV
-          }
-
-      - name: Get Public IP as Fallback
-        if: env.TAILSCALE_IP == 'LOCAL_ONLY'
-        run: |
-          try {
-              $publicIP = (Invoke-WebRequest -Uri "https://api.ipify.org" -TimeoutSec 10).Content
-              echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
-              Write-Host "Public IP: $publicIP"
-          } catch {
-              Write-Host "Could not retrieve public IP"
-              echo "PUBLIC_IP=UNKNOWN" >> $env:GITHUB_ENV
-          }
-
-      - name: Display Connection Information
-        run: |
-          Write-Host "=== 20 RDP SESSIONS SETUP COMPLETE ==="
-          Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_PASSWORD"
-          Write-Host "RDP Ports: 3389 to 3408"
-          
-          if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -ne 'LOCAL_ONLY') {
-              Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-              Write-Host "Connection method: Tailscale VPN"
-          } elseif ($env:PUBLIC_IP -and $env:PUBLIC_IP -ne 'UNKNOWN') {
-              Write-Host "Public IP: $env:PUBLIC_IP"
-              Write-Host "Connection method: Public IP (if ports are open)"
-          } else {
-              Write-Host "Connection: Local machine only"
-          }
-          
-          Write-Host "Example connections:"
-          Write-Host "  mstsc /v:$env:TAILSCALE_IP:3389"
-          Write-Host "  mstsc /v:$env:TAILSCALE_IP:3390"
-          Write-Host "  ... etc up to port 3408"
-          Write-Host "======================================"
-
-      - name: Permanent RDP Session
-        run: |
-          $startTime = Get-Date
-          $checkCount = 0
-          
-          while ($true) {
-              $checkCount++
-              $uptime = (Get-Date) - $startTime
-              
-              # فحص دوري
-              if ($checkCount % 120 -eq 0) {
-                  Write-Host "[$(Get-Date)] Health Check - Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))"
-                  
-                  # فحص خدمة RDP
-                  $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
-                  if ($rdpService.Status -ne 'Running') {
-                      Write-Host "Restarting RDP Service..."
-                      Start-Service -Name TermService -Force
-                  }
-              }
-              
-              # تحديث الحالة كل دقيقة
-              if ($checkCount % 12 -eq 0) {
-                  Write-Host "[$(Get-Date)] RDP Sessions Active - Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))"
-              }
-              
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        run: |
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Display RDP Access Information
+        run: |
+          Write-Host "`n=== MULTIPLE RDP ACCESS (20 Users) ==="
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Port: 3389"
+          Write-Host "`n=== USER CREDENTIALS ==="
+          
+          # Parse and display all users
+          $users = $env:RDP_USERS_JSON | ConvertFrom-Json
+          $counter = 1
+          foreach ($user in $users) {
+              Write-Host "$counter. Username: $($user.Username) | Password: $($user.Password)"
+              $counter++
+          }
+          
+          Write-Host "`n=== CONNECTION INSTRUCTIONS ==="
+          Write-Host "1. Connect to: $env:TAILSCALE_IP"
+          Write-Host "2. Use any of the 20 usernames/passwords above"
+          Write-Host "3. Multiple users can connect simultaneously"
+          Write-Host "===============================`n"
+
+      - name: Maintain Connection
+        run: |
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Server Active - 20 Users Available - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
           }
