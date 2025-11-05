@@ -1,0 +1,174 @@
+name: 20 RDP Sessions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+
+    steps:
+      - name: Configure Multiple RDP Ports
+        run: |
+          # تمكين RDP الأساسي
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+
+          # إنشاء 20 منفذ لـ RDP (3389 إلى 3408)
+          for ($port = 3389; $port -le 3408; $port++) {
+              Write-Host "Creating RDP port $port"
+              
+              # نسخ إعدادات RDP الأساسية للمنفذ الجديد
+              $rdpParams = Get-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+              New-Item -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp$port" -Force
+              
+              # نسخ جميع الإعدادات
+              $rdpParams.PSObject.Properties | ForEach-Object {
+                  if ($_.Name -notin @('PSPath', 'PSParentPath', 'PSChildName', 'PSDrive', 'PSProvider')) {
+                      Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp$port" `
+                                       -Name $_.Name -Value $_.Value -Force
+                  }
+              }
+              
+              # تعيين المنفذ المخصص
+              Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp$port" `
+                               -Name "PortNumber" -Value $port -Force
+
+              # إضافة قاعدة جدار حماية للمنفذ
+              netsh advfirewall firewall add rule name="RDP-Port-$port" `
+                dir=in action=allow protocol=TCP localport=$port
+          }
+
+          # إعادة تشغيل الخدمة
+          Restart-Service -Name TermService -Force
+
+      - name: Create Single RDP User
+        run: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)      # A-Z
+              Lower   = [char[]](97..122)     # a-z
+              Number  = [char[]](48..57)      # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Special characters
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # إنشاء مستخدم واحد فقط
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-20rdp-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 15) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+      
+      - name: Verify All RDP Ports
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Testing all 20 RDP ports..."
+          
+          $activePorts = @()
+          for ($port = 3389; $port -le 3408; $port++) {
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $port -WarningAction SilentlyContinue
+              if ($testResult.TcpTestSucceeded) {
+                  $activePorts += $port
+                  Write-Host "✅ Port $port: ACTIVE"
+              } else {
+                  Write-Host "❌ Port $port: FAILED"
+              }
+          }
+          
+          Write-Host "`n🎯 Active RDP Ports: $($activePorts -join ', ')"
+          echo "ACTIVE_PORTS=$($activePorts -join ',')" >> $env:GITHUB_ENV
+
+      - name: Permanent Multi-RDP Session
+        run: |
+          Write-Host "`n🎯 === 20 RDP SESSIONS ==="
+          Write-Host "📍 Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "👤 Username: RDP"
+          Write-Host "🔑 Password: $(echo $env:RDP_CREDS)"
+          Write-Host "🔌 Active Ports: $env:ACTIVE_PORTS"
+          Write-Host "📊 Total Ports: 20 (3389-3408)"
+          Write-Host "⏰ Started: $(Get-Date)"
+          Write-Host "💡 Status: PERMANENT - 20 Simultaneous RDP Sessions"
+          Write-Host "🛑 To stop: Click 'Cancel workflow' in GitHub Actions"
+          Write-Host "=====================================`n"
+          
+          # مثال للاتصال
+          Write-Host "💡 Connection Examples:"
+          Write-Host "   mstsc /v:$env:TAILSCALE_IP:3389"
+          Write-Host "   mstsc /v:$env:TAILSCALE_IP:3390"
+          Write-Host "   ... up to :3408`n"
+          
+          $startTime = Get-Date
+          $checkCount = 0
+          
+          while ($true) {
+              $checkCount++
+              $uptime = (Get-Date) - $startTime
+              
+              # فحص دوري كل 10 دقائق
+              if ($checkCount % 120 -eq 0) {
+                  Write-Host "[$(Get-Date)] 🔍 Health Check - Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))"
+                  
+                  # فحص خدمة RDP
+                  $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+                  if ($rdpService.Status -ne 'Running') {
+                      Write-Host "   🔄 Restarting RDP Service..."
+                      Start-Service -Name TermService -Force
+                  }
+                  
+                  # فحص عشوائي لبضعة منافذ
+                  $samplePorts = 3389, 3395, 3400, 3408
+                  foreach ($port in $samplePorts) {
+                      $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $port -WarningAction SilentlyContinue
+                      Write-Host "   📡 Port $port: $(if ($test.TcpTestSucceeded) {'✅'} else {'❌'})"
+                  }
+              }
+              
+              # تحديث الحالة كل دقيقة
+              if ($checkCount % 12 -eq 0) {
+                  Write-Host "[$(Get-Date)] 🟢 20 RDP Sessions Active - Uptime: $($uptime.ToString('dd\.hh\:mm\:ss'))"
+              }
+              
+              Start-Sleep -Seconds 5
+          }
