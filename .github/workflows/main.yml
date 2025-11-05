@@ -1,4 +1,4 @@
-name: Multiple RDP
+name: RDP
 
 on:
   workflow_dispatch:
@@ -26,7 +26,7 @@ jobs:
 
           Restart-Service -Name TermService -Force
 
-      - name: Create Multiple RDP Users
+      - name: Create RDP Users
         run: |
           # Function to generate secure random password
           function New-SecurePassword {
@@ -110,7 +110,7 @@ jobs:
 
       - name: Display RDP Access Information
         run: |
-          Write-Host "`n=== MULTIPLE RDP ACCESS (20 Users) ==="
+          Write-Host "`n=== RDP ACCESS (20 Users) ==="
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Port: 3389"
           Write-Host "`n=== USER CREDENTIALS ==="
