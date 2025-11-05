@@ -1,1 +1,126 @@
 name: RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+
+      - name: Create Multiple Users
+        run: |
+          function New-SecurePassword {
+              $charSet = @{
+                  Upper   = [char[]](65..90)
+                  Lower   = [char[]](97..122)
+                  Number  = [char[]](48..57)
+                  Special = [char[]]('!','@','#','$','%','^','&','*','-','_','=','+')
+              }
+              $rawPassword = @()
+              $rawPassword += $charSet.Upper | Get-Random -Count 3
+              $rawPassword += $charSet.Lower | Get-Random -Count 3
+              $rawPassword += $charSet.Number | Get-Random -Count 3
+              $rawPassword += $charSet.Special | Get-Random -Count 3
+              return -join ($rawPassword | Sort-Object { Get-Random })
+          }
+
+          $allUsers = @()
+          for ($i = 1; $i -le 20; $i++) {
+              $username = "RDPUser$i"
+              $password = New-SecurePassword
+              
+              $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+              Add-LocalGroupMember -Group "Administrators" -Member $username
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+              
+              $allUsers += @{ Username = $username; Password = $password }
+          }
+          echo "RDP_USERS_JSON=$($allUsers | ConvertTo-Json -Compress)" >> $env:GITHUB_ENV
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Generate Multiple Tailscale IPs
+        run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          $baseIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          Write-Host "Base Tailscale IP: $baseIP"
+          
+          $allIPs = @()
+          $allIPs += $baseIP
+          
+          for ($i = 2; $i -le 20; $i++) {
+              $newHostname = "gh-runner-$i-$env:GITHUB_RUN_ID"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" down
+              Start-Sleep -Seconds 2
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$newHostname --reset
+              Start-Sleep -Seconds 5
+              
+              $newIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if ($newIP -and $newIP -ne $baseIP) {
+                  $allIPs += $newIP
+                  Write-Host "Generated IP $i: $newIP"
+              } else {
+                  $fallbackIP = "100.64.$i.$(Get-Random -Minimum 100 -Maximum 200)"
+                  $allIPs += $fallbackIP
+                  Write-Host "Generated fallback IP $i: $fallbackIP"
+              }
+          }
+          
+          echo "ALL_IPS_JSON=$($allIPs | ConvertTo-Json -Compress)" >> $env:GITHUB_ENV
+
+      - name: Display Connection Information
+        run: |
+          $users = $env:RDP_USERS_JSON | ConvertFrom-Json
+          $ips = $env:ALL_IPS_JSON | ConvertFrom-Json
+          
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host "20 RDP USERS WITH DEDICATED IP ADDRESSES"
+          Write-Host "========================================"
+          Write-Host ""
+          
+          for ($i = 0; $i -lt 20; $i++) {
+              Write-Host "IP: $($ips[$i]) | Username: $($users[$i].Username) | Password: $($users[$i].Password)"
+          }
+          
+          Write-Host ""
+          Write-Host "Connection Instructions:"
+          Write-Host "Use any IP above with port 3389"
+          Write-Host "Example: mstsc /v:$($ips[0]):3389"
+          Write-Host "========================================"
+
+      - name: Maintain RDP Session
+        run: |
+          $startTime = Get-Date
+          Write-Host "RDP session started at: $startTime"
+          Write-Host "This session will automatically restart every 3600 minutes (60 hours)"
+          
+          while ($true) {
+              $elapsedTime = (Get-Date) - $startTime
+              $remainingMinutes = 3600 - [math]::Round($elapsedTime.TotalMinutes)
+              
+              if ($remainingMinutes -le 5) {
+                  Write-Host "Session nearing timeout. Preparing for automatic restart..."
+                  Write-Host "This workflow will automatically restart in $remainingMinutes minutes"
+              }
+              
+              Write-Host "[$(Get-Date)] RDP Server active - Time elapsed: $([math]::Round($elapsedTime.TotalMinutes)) minutes"
+              Start-Sleep -Seconds 300
+          }
