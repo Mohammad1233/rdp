@@ -1,4 +1,4 @@
-name: RDP
+name: Multi RDP Setup with Single IP
 
 on:
   workflow_dispatch:
@@ -152,7 +152,7 @@ jobs:
         run: |
           $users = $env:RDP_USERS | ConvertFrom-Json
           
-          Write-Host "`n=== Testing All RDP Ports on Single IP ==="
+          Write-Host "Testing All RDP Ports on Single IP"
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host "Testing ports: 3389 to $(3389 + $users.Count - 1)"
           Write-Host "=" * 50
@@ -160,9 +160,9 @@ jobs:
           foreach ($user in $users) {
               $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $user.Port -ErrorAction SilentlyContinue
               if ($testResult.TcpTestSucceeded) {
-                  Write-Host "✓ Port $($user.Port): ACCESSIBLE - User: $($user.Username)"
+                  Write-Host "Port $($user.Port): ACCESSIBLE - User: $($user.Username)"
               } else {
-                  Write-Host "✗ Port $($user.Port): FAILED - User: $($user.Username)"
+                  Write-Host "Port $($user.Port): FAILED - User: $($user.Username)"
               }
           }
 
@@ -170,40 +170,39 @@ jobs:
         run: |
           $users = $env:RDP_USERS | ConvertFrom-Json
           
-          Write-Host "`n" + "="*60
-          Write-Host "🎯 MULTIPLE RDP ACCESS POINTS - SINGLE IP"
+          Write-Host "MULTIPLE RDP ACCESS POINTS - SINGLE IP"
           Write-Host "="*60
-          Write-Host "🌐 Single Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "📊 Total Connections: $env:RDP_COUNT"
-          Write-Host "🔌 Different Ports, Same IP"
+          Write-Host "Single Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Total Connections: $env:RDP_COUNT"
+          Write-Host "Different Ports, Same IP"
           Write-Host "="*60
           
           foreach ($user in $users) {
               $connectionNumber = $users.IndexOf($user) + 1
               Write-Host "Connection $connectionNumber:"
-              Write-Host "  🌐 Address: $env:TAILSCALE_IP:$($user.Port)"
-              Write-Host "  👤 Username: $($user.Username)"
-              Write-Host "  🔑 Password: $($user.Password)"
-              Write-Host "  🚪 Port: $($user.Port)"
+              Write-Host "  Address: $env:TAILSCALE_IP:$($user.Port)"
+              Write-Host "  Username: $($user.Username)"
+              Write-Host "  Password: $($user.Password)"
+              Write-Host "  Port: $($user.Port)"
               Write-Host "-" * 50
           }
           
-          Write-Host "📝 Usage Examples:"
-          Write-Host "   • mstsc /v:$env:TAILSCALE_IP:3389"
-          Write-Host "   • mstsc /v:$env:TAILSCALE_IP:3390"
-          Write-Host "   • mstsc /v:$env:TAILSCALE_IP:3391"
+          Write-Host "Usage Examples:"
+          Write-Host "   mstsc /v:$env:TAILSCALE_IP:3389"
+          Write-Host "   mstsc /v:$env:TAILSCALE_IP:3390"
+          Write-Host "   mstsc /v:$env:TAILSCALE_IP:3391"
           Write-Host "="*60
 
       - name: Maintain All Connections
         run: |
           $users = $env:RDP_USERS | ConvertFrom-Json
           
-          Write-Host "🔄 Monitoring all RDP connections on single IP: $env:TAILSCALE_IP"
+          Write-Host "Monitoring all RDP connections on single IP: $env:TAILSCALE_IP"
           $minuteCounter = 0
           
           while ($true) {
               $minuteCounter++
-              Write-Host "`n[$(Get-Date)] Status Check #$minuteCounter - IP: $env:TAILSCALE_IP"
+              Write-Host "[$(Get-Date)] Status Check #$minuteCounter - IP: $env:TAILSCALE_IP"
               Write-Host "Active Ports: $(($users | ForEach-Object { $_.Port }) -join ', ')"
               
               $activePorts = 0
@@ -211,14 +210,14 @@ jobs:
                   $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $user.Port -ErrorAction SilentlyContinue
                   if ($testResult.TcpTestSucceeded) {
                       $activePorts++
-                      Write-Host "  ✓ Port $($user.Port): READY"
+                      Write-Host "  Port $($user.Port): READY"
                   } else {
-                      Write-Host "  ✗ Port $($user.Port): OFFLINE"
+                      Write-Host "  Port $($user.Port): OFFLINE"
                   }
               }
               
               Write-Host "Summary: $activePorts/$($users.Count) ports active"
-              Write-Host "⏰ Next check in 5 minutes..."
+              Write-Host "Next check in 5 minutes..."
               Write-Host "Use GitHub UI to cancel workflow when done"
               
               Start-Sleep -Seconds 300
