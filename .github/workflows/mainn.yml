@@ -1,4 +1,4 @@
-name: Multi RDP Setup with Unique IPs
+name: rdp
 
 on:
   workflow_dispatch:
