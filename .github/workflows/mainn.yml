@@ -87,28 +87,44 @@ jobs:
         run: |
           $users = $env:RDP_USERS | ConvertFrom-Json
           
-          # Configure registry for default port (3389) for first user
-          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-                           -Name "PortNumber" -Value 3389 -Force
-          
-          # Create additional registry entries for multiple ports
+          # الطريقة الصحيحة لإنشاء منافذ متعددة لـ RDP
           foreach ($user in $users) {
               $port = $user.Port
               
-              # Clone the RDP-Tcp configuration for additional ports
-              $sourcePath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
-              $destPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp$port"
+              # إنشاء مفتاح registry جديد للمنفذ
+              $rdpPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations"
+              $newKeyName = "RDP-Tcp$port"
+              $newKeyPath = "$rdpPath\$newKeyName"
               
-              # Remove existing if present
-              Remove-Item -Path $destPath -ErrorAction SilentlyContinue
+              # حذف المفتاح إذا كان موجوداً
+              Remove-Item -Path $newKeyPath -Recurse -Force -ErrorAction SilentlyContinue
               
-              # Copy registry key
-              reg copy $sourcePath $destPath /s /f
+              # إنشاء المفتاح الجديد
+              New-Item -Path $newKeyPath -Force
               
-              # Update port number in the new key
-              Set-ItemProperty -Path $destPath -Name "PortNumber" -Value $port
+              # نسخ القيم من المفتاح الأساسي
+              $sourceKey = "$rdpPath\RDP-Tcp"
+              $properties = Get-ItemProperty -Path $sourceKey
               
-              # Firewall rule for each port
+              # تعيين الخصائص الأساسية
+              Set-ItemProperty -Path $newKeyPath -Name "PortNumber" -Value $port
+              Set-ItemProperty -Path $newKeyPath -Name "LanAdapter" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "Transport" -Value 1
+              Set-ItemProperty -Path $newKeyPath -Name "fEnableWinStation" -Value 1
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritInitialProgram" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritAutoLogon" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritCallback" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritCallbackNumber" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritShadow" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritResetBroken" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritReconnectSame" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritMaxSessionTime" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritMaxDisconnectionTime" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritMaxIdleTime" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritAutoClient" -Value 0
+              Set-ItemProperty -Path $newKeyPath -Name "fInheritSecurity" -Value 0
+              
+              # قاعدة جدار الحماية للمنفذ
               netsh advfirewall firewall delete rule name="RDP-Port$port" -ErrorAction SilentlyContinue
               netsh advfirewall firewall add rule name="RDP-Port$port" `
                   dir=in action=allow protocol=TCP localport=$port
@@ -116,8 +132,9 @@ jobs:
               Write-Host "Configured RDP on port: $port"
           }
           
-          # Restart Terminal Services to apply all port changes
+          # إعادة تشغيل الخدمة لتطبيق التغييرات
           Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 10
 
       - name: Install Tailscale
         run: |
