@@ -1,4 +1,4 @@
-name: rdp
+name: RDP
 
 on:
   workflow_dispatch:
@@ -87,12 +87,26 @@ jobs:
         run: |
           $users = $env:RDP_USERS | ConvertFrom-Json
           
+          # Configure registry for default port (3389) for first user
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+                           -Name "PortNumber" -Value 3389 -Force
+          
+          # Create additional registry entries for multiple ports
           foreach ($user in $users) {
               $port = $user.Port
               
-              # Configure registry for multiple ports
-              Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
-                               -Name "PortNumber" -Value $port -Force
+              # Clone the RDP-Tcp configuration for additional ports
+              $sourcePath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+              $destPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp$port"
+              
+              # Remove existing if present
+              Remove-Item -Path $destPath -ErrorAction SilentlyContinue
+              
+              # Copy registry key
+              reg copy $sourcePath $destPath /s /f
+              
+              # Update port number in the new key
+              Set-ItemProperty -Path $destPath -Name "PortNumber" -Value $port
               
               # Firewall rule for each port
               netsh advfirewall firewall delete rule name="RDP-Port$port" -ErrorAction SilentlyContinue
@@ -101,6 +115,9 @@ jobs:
               
               Write-Host "Configured RDP on port: $port"
           }
+          
+          # Restart Terminal Services to apply all port changes
+          Restart-Service -Name TermService -Force
 
       - name: Install Tailscale
         run: |
@@ -111,114 +128,98 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Create Multiple Tailscale Connections
-        id: tailscale_connections
+      - name: Establish Single Tailscale Connection
         run: |
-          $users = $env:RDP_USERS | ConvertFrom-Json
-          $connections = @()
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-multi-rdp-$env:GITHUB_RUN_ID
           
-          foreach ($user in $users) {
-              $sessionNumber = $users.IndexOf($user) + 1
-              
-              # Generate unique hostname for each connection
-              $hostname = "gh-rdp-$env:GITHUB_RUN_ID-session$sessionNumber"
-              
-              Write-Host "Creating Tailscale connection for session $sessionNumber..."
-              
-              # Reset Tailscale to get new IP
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" down
-              Start-Sleep -Seconds 2
-              
-              # Create unique Tailscale connection
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname --accept-routes --reset
-              
-              # Get unique Tailscale IP for this session
-              $tsIP = $null
-              $retries = 0
-              while (-not $tsIP -and $retries -lt 10) {
-                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-                  if (-not $tsIP) {
-                      Start-Sleep -Seconds 3
-                      $retries++
-                  }
-              }
-              
-              if (-not $tsIP) {
-                  Write-Error "Tailscale IP not assigned for session $sessionNumber"
-                  exit 1
-              }
-              
-              # Store connection info
-              $connections += @{
-                  Username = $user.Username
-                  Password = $user.Password
-                  Port = $user.Port
-                  TailscaleIP = $tsIP
-                  SessionNumber = $sessionNumber
-              }
-              
-              Write-Host "✓ Session $sessionNumber - Tailscale IP: $tsIP"
-              
-              # Small delay between connections
+          # Get Single Tailscale IP
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
               Start-Sleep -Seconds 5
+              $retries++
           }
           
-          # Save all connections info
-          $connectionsJson = $connections | ConvertTo-Json -Compress
-          echo "RDP_CONNECTIONS=$connectionsJson" >> $env:GITHUB_ENV
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned"
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Single Tailscale IP: $tsIP"
 
       - name: Verify Multiple RDP Connections
         run: |
-          $connections = $env:RDP_CONNECTIONS | ConvertFrom-Json
+          $users = $env:RDP_USERS | ConvertFrom-Json
           
-          Write-Host "`n=== Testing All RDP Connections ==="
-          foreach ($conn in $connections) {
-              $testResult = Test-NetConnection -ComputerName $conn.TailscaleIP -Port $conn.Port -ErrorAction SilentlyContinue
+          Write-Host "`n=== Testing All RDP Ports on Single IP ==="
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "Testing ports: 3389 to $(3389 + $users.Count - 1)"
+          Write-Host "=" * 50
+          
+          foreach ($user in $users) {
+              $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $user.Port -ErrorAction SilentlyContinue
               if ($testResult.TcpTestSucceeded) {
-                  Write-Host "✓ Session $($conn.SessionNumber): $($conn.TailscaleIP):$($conn.Port) - ACCESSIBLE"
+                  Write-Host "✓ Port $($user.Port): ACCESSIBLE - User: $($user.Username)"
               } else {
-                  Write-Host "✗ Session $($conn.SessionNumber): $($conn.TailscaleIP):$($conn.Port) - FAILED"
+                  Write-Host "✗ Port $($user.Port): FAILED - User: $($user.Username)"
               }
           }
 
       - name: Display RDP Access Information
         run: |
-          $connections = $env:RDP_CONNECTIONS | ConvertFrom-Json
+          $users = $env:RDP_USERS | ConvertFrom-Json
           
           Write-Host "`n" + "="*60
-          Write-Host "🎯 MULTIPLE RDP ACCESS POINTS - UNIQUE IPs"
+          Write-Host "🎯 MULTIPLE RDP ACCESS POINTS - SINGLE IP"
           Write-Host "="*60
-          Write-Host "Total Connections: $env:RDP_COUNT"
-          Write-Host "Each connection has different Tailscale IP"
+          Write-Host "🌐 Single Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host "📊 Total Connections: $env:RDP_COUNT"
+          Write-Host "🔌 Different Ports, Same IP"
           Write-Host "="*60
           
-          foreach ($conn in $connections) {
-              Write-Host "Connection $($conn.SessionNumber):"
-              Write-Host "  🌐 Address: $($conn.TailscaleIP):$($conn.Port)"
-              Write-Host "  👤 Username: $($conn.Username)"
-              Write-Host "  🔑 Password: $($conn.Password)"
-              Write-Host "  🆔 Session: $($conn.SessionNumber)"
+          foreach ($user in $users) {
+              $connectionNumber = $users.IndexOf($user) + 1
+              Write-Host "Connection $connectionNumber:"
+              Write-Host "  🌐 Address: $env:TAILSCALE_IP:$($user.Port)"
+              Write-Host "  👤 Username: $($user.Username)"
+              Write-Host "  🔑 Password: $($user.Password)"
+              Write-Host "  🚪 Port: $($user.Port)"
               Write-Host "-" * 50
           }
           
-          Write-Host "📝 Usage: Connect using [IP]:[PORT] with the credentials above"
+          Write-Host "📝 Usage Examples:"
+          Write-Host "   • mstsc /v:$env:TAILSCALE_IP:3389"
+          Write-Host "   • mstsc /v:$env:TAILSCALE_IP:3390"
+          Write-Host "   • mstsc /v:$env:TAILSCALE_IP:3391"
           Write-Host "="*60
 
       - name: Maintain All Connections
         run: |
-          $connections = $env:RDP_CONNECTIONS | ConvertFrom-Json
+          $users = $env:RDP_USERS | ConvertFrom-Json
           
-          Write-Host "🔄 Monitoring all RDP connections..."
+          Write-Host "🔄 Monitoring all RDP connections on single IP: $env:TAILSCALE_IP"
+          $minuteCounter = 0
+          
           while ($true) {
-              Write-Host "`n[$(Get-Date)] Status Check - $env:RDP_COUNT Active Connections:"
+              $minuteCounter++
+              Write-Host "`n[$(Get-Date)] Status Check #$minuteCounter - IP: $env:TAILSCALE_IP"
+              Write-Host "Active Ports: $(($users | ForEach-Object { $_.Port }) -join ', ')"
               
-              foreach ($conn in $connections) {
-                  $testResult = Test-NetConnection -ComputerName $conn.TailscaleIP -Port $conn.Port -ErrorAction SilentlyContinue
-                  $status = if ($testResult.TcpTestSucceeded) { "ACTIVE ✓" } else { "INACTIVE ✗" }
-                  
-                  Write-Host "  Session $($conn.SessionNumber): $($conn.TailscaleIP):$($conn.Port) - $status"
+              $activePorts = 0
+              foreach ($user in $users) {
+                  $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port $user.Port -ErrorAction SilentlyContinue
+                  if ($testResult.TcpTestSucceeded) {
+                      $activePorts++
+                      Write-Host "  ✓ Port $($user.Port): READY"
+                  } else {
+                      Write-Host "  ✗ Port $($user.Port): OFFLINE"
+                  }
               }
               
-              Write-Host "`nUse GitHub UI to cancel workflow when done"
+              Write-Host "Summary: $activePorts/$($users.Count) ports active"
+              Write-Host "⏰ Next check in 5 minutes..."
+              Write-Host "Use GitHub UI to cancel workflow when done"
+              
               Start-Sleep -Seconds 300
           }
